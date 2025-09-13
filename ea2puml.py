@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # ============================================================
-# EA → PlantUML Exporter (Packages + Lollipop + Block Notes)
+# EA → PlantUML Exporter (Packages + Lollipop + Block Notes, v2)
 # ------------------------------------------------------------
-# - Groups elements inside package blocks using on-diagram geometry
+# - Groups elements inside package blocks using on-diagram geometry:
+#   center-in-rect OR area-overlap >= 50%
 # - Preserves package colors
 # - Lollipop interfaces by default (configurable)
-# - Block notes with real newlines; tagged values Value/Notes
+# - Block notes with real newlines; tagged values from Value or Notes
 # - Alias modes: uuid | human (default) | name
 # - Edge labels default: both (name + stereotype) to match EA figure
+# - Packages ordered by top-to-bottom, then left-to-right (closer to EA)
+# - Robust connector endpoint resolution (InstanceUID fallback via ElementID)
+# - Default output folder: ./output
 # ============================================================
 
 import argparse
@@ -69,7 +73,7 @@ class AliasFactory:
 
 ELEMENT_TYPE_TO_PUML = {
     "Class": "class",
-    "Interface": "interface",     # (we can switch to lollipop in renderer)
+    "Interface": "interface",     # (renderer can switch to lollipop)
     "Enumeration": "enum",
     "Component": "component",
     "Node": "node",
@@ -141,8 +145,9 @@ class EAPlantUMLExporter:
         self.elements: Dict[str, dict] = {}     # by DiagramObject.InstanceGUID
         self.connectors: Dict[str, dict] = {}   # by DiagramLink.ConnectorID
         self.alias_by_guid: Dict[str, str] = {}
-        self.packages: Dict[str, dict] = {}     # package diag obj rect + color
-        self.members_in_pkg: Dict[str, List[str]] = {}  # pkg_guid -> list of element guids
+        self.packages: Dict[str, dict] = {}     # pkg rect + color
+        self.members_in_pkg: Dict[str, List[str]] = {}  # pkg_guid -> [element guids]
+        self.elemid_to_instuid: Dict[int, str] = {}     # model ElementID -> InstanceUID on diagram
 
     # -------- COM ----------
     def connect_ea(self):
@@ -167,27 +172,54 @@ class EAPlantUMLExporter:
         return {"x": x, "y": y, "w": w, "h": h}
 
     @staticmethod
-    def inside(inner_rect: dict, outer_rect: dict) -> bool:
-        # Inclusive containment
-        return (inner_rect["x"] >= outer_rect["x"] and
-                inner_rect["y"] >= outer_rect["y"] and
-                inner_rect["x"] + inner_rect["w"] <= outer_rect["x"] + outer_rect["w"] and
-                inner_rect["y"] + inner_rect["h"] <= outer_rect["y"] + outer_rect["h"])
+    def center(rect: dict) -> Tuple[int, int]:
+        return (rect["x"] + rect["w"] // 2, rect["y"] + rect["h"] // 2)
+
+    @staticmethod
+    def area(rect: dict) -> int:
+        return max(0, rect["w"]) * max(0, rect["h"])
+
+    @staticmethod
+    def overlap_area(a: dict, b: dict) -> int:
+        x1 = max(a["x"], b["x"])
+        y1 = max(a["y"], b["y"])
+        x2 = min(a["x"] + a["w"], b["x"] + b["w"])
+        y2 = min(a["y"] + a["h"], b["y"] + b["h"])
+        if x2 <= x1 or y2 <= y1:
+            return 0
+        return (x2 - x1) * (y2 - y1)
+
+    @staticmethod
+    def center_inside(inner_rect: dict, outer_rect: dict) -> bool:
+        cx, cy = EAPlantUMLExporter.center(inner_rect)
+        return (cx >= outer_rect["x"] and
+                cy >= outer_rect["y"] and
+                cx <= outer_rect["x"] + outer_rect["w"] and
+                cy <= outer_rect["y"] + outer_rect["h"])
+
+    # -------- Endpoint resolution ----------
+    def resolve_endpoint_uid(self, dlnk, dconn, which: str) -> Optional[str]:
+        """Return a diagram InstanceUID for connector endpoint ('source' or 'target')."""
+        uid = dlnk.SourceInstanceUID if which == "source" else dlnk.TargetInstanceUID
+        if uid and uid in self.elements:
+            return uid
+        elem_id = int(dconn.ClientID) if which == "source" else int(dconn.SupplierID)
+        return self.elemid_to_instuid.get(elem_id)
 
     # -------- Gather ----------
     def gather(self, diagram, cornerX=0, cornerY=0):
-        # First pass: collect all elements (including packages) with geometry
-        temp_rects: Dict[str, dict] = {}
+        # First pass: collect elements with geometry
         for dObj in diagram.DiagramObjects:
             dElem = self.repo.GetElementByID(dObj.ElementID)
             inst_guid = dObj.InstanceGUID
+            # index model ElementID -> this diagram InstanceUID (first seen)
+            self.elemid_to_instuid.setdefault(int(dObj.ElementID), inst_guid)
             alias = self.alias_factory.make(inst_guid, dElem.Name or "")
             self.alias_by_guid[inst_guid] = alias
 
             rect = self.rect(dObj, cornerX, cornerY)
-            temp_rects[inst_guid] = rect
-
             bg = ea_color_long_to_hex(getattr(dObj, "BackgroundColor", -1)) if self.include_colors else None
+
             el = {
                 "guid": inst_guid,
                 "alias": alias,
@@ -204,7 +236,6 @@ class EAPlantUMLExporter:
             self.elements[inst_guid] = el
 
             if el["type"] == "Package":
-                # remember package rectangles and color
                 self.packages[inst_guid] = {
                     "guid": inst_guid,
                     "name": el["name"],
@@ -221,13 +252,18 @@ class EAPlantUMLExporter:
                 sub = self.repo.GetDiagramByID(diagID)
                 self.gather(sub, dObj.Left, -dObj.Top)
 
-        # Second pass: build package membership by geometry
+        # Second pass: geometry-based package membership
         for pkg_guid, pkg in self.packages.items():
-            members = []
+            members: List[str] = []
+            preg = pkg["rect"]
             for guid, el in self.elements.items():
                 if guid == pkg_guid:
                     continue
-                if self.inside(el["rect"], pkg["rect"]):
+                erect = el["rect"]
+                # center-in-rect OR overlap >= 50% of element area
+                ov = self.overlap_area(erect, preg)
+                inside = self.center_inside(erect, preg) or (ov >= 0.5 * self.area(erect))
+                if inside:
                     members.append(guid)
             self.members_in_pkg[pkg_guid] = members
 
@@ -236,14 +272,21 @@ class EAPlantUMLExporter:
             if dLnk.IsHidden:
                 continue
             dConn = self.repo.GetConnectorByID(dLnk.ConnectorID)
+
+            source_uid = self.resolve_endpoint_uid(dLnk, dConn, "source")
+            target_uid = self.resolve_endpoint_uid(dLnk, dConn, "target")
+            if not source_uid or not target_uid:
+                # endpoint not on this diagram (or hidden) -> skip
+                continue
+
             conn = {
                 "id": str(dLnk.ConnectorID),
                 "name": dConn.Name or "",
                 "type": dConn.Type or "",
                 "stereotype": dConn.Stereotype or "",
                 "direction": dConn.Direction or "Unspecified",
-                "source_uid": dLnk.SourceInstanceUID,
-                "target_uid": dLnk.TargetInstanceUID,
+                "source_uid": source_uid,
+                "target_uid": target_uid,
                 "line_hex": ea_color_long_to_hex(getattr(dLnk, "LineColor", -1)) if self.include_colors else None,
                 "line_width": getattr(dLnk, "LineWidth", 1),
                 "hidden_labels": bool(getattr(dLnk, "HiddenLabels", False)),
@@ -290,7 +333,6 @@ class EAPlantUMLExporter:
         return el["alias"]
 
     def element_decl(self, el: dict) -> str:
-        """Element (non-package) declaration with interface style & stereotypes policy."""
         name = el["name"] or ""
         st = el["stereotype"] or ""
         etype = el["type"] or ""
@@ -298,7 +340,7 @@ class EAPlantUMLExporter:
         bg = el["bg_hex"]
         keyword = ELEMENT_TYPE_TO_PUML.get(etype, "rectangle")
 
-        # Block note elements (Note/Text): use note block to preserve newlines
+        # Block note elements (Note/Text)
         if etype in ("Note", "Text"):
             txt = (el["notes"] or name)
             lines = [f"note as {alias or (slugify_name(name) or 'Note_1')}"]
@@ -318,9 +360,8 @@ class EAPlantUMLExporter:
         disp = f'"{puml_escape_inline(name_disp)}"'
         color = f' {bg}' if bg else ""
 
-        # Interface style
+        # Interface style (lollipop)
         if etype == "Interface" and self.interface_style == "lollipop":
-            # lollipop syntax uses () name; alias still needed for edges unless alias_mode=name
             if self.alias_mode == "name":
                 return f'() {disp}{color}'
             else:
@@ -359,14 +400,15 @@ class EAPlantUMLExporter:
         return f"note right of {ref}\n" + "\n".join(lines) + "\nend note"
 
     def render_elements_grouped(self) -> str:
-        """Emit packages with members inside; then emit leftover (non-contained) elements."""
+        """Emit packages (ordered TL->BR) with members inside; then leftovers."""
         emitted: set = set()
         out: List[str] = []
 
-        # Emit packages with contents
-        # Sort packages by area descending so larger containers appear first
-        def area(r): return r["w"] * r["h"]
-        sorted_pkgs = sorted(self.packages.values(), key=lambda p: -area(p["rect"]))
+        # sort packages by Y, then X (top-to-bottom then left-to-right)
+        def pkg_key(p):
+            r = p["rect"]
+            return (r["y"], r["x"])
+        sorted_pkgs = sorted(self.packages.values(), key=pkg_key)
 
         for pkg in sorted_pkgs:
             name = pkg["name"]
@@ -376,11 +418,10 @@ class EAPlantUMLExporter:
             hdr += " {"
             out.append(hdr)
 
-            # members inside
             for guid in self.members_in_pkg.get(pkg["guid"], []):
                 el = self.elements[guid]
                 if el["type"] == "Package":
-                    continue  # nested package (rare) - could recurse if needed
+                    continue
                 out.append(self.element_decl(el))
                 tagb = self.tag_block_for_element(el)
                 if tagb:
@@ -390,11 +431,9 @@ class EAPlantUMLExporter:
             out.append("}")
             out.append("")
 
-        # Emit any non-contained elements (including interfaces that were outside regions)
+        # leftovers (not contained by any package region)
         for guid, el in self.elements.items():
-            if el["type"] == "Package":
-                continue
-            if guid in emitted:
+            if el["type"] == "Package" or guid in emitted:
                 continue
             out.append(self.element_decl(el))
             tagb = self.tag_block_for_element(el)
@@ -492,24 +531,21 @@ class EAPlantUMLExporter:
         out.append("")
         return "\n".join(out)
 
+    # -------- Main --------
     def export(self, outdir: str, filename: Optional[str] = None):
         self.connect_ea()
         diagram = self.get_selected_diagram()
         self.gather(diagram)
 
-        lines = []
-        # header
-        lines.append(self.render_header(diagram))  # call the first render_header
-
+        lines = [self.render_header(diagram)]
         if self.is_sequence_diagram(diagram):
             lines.append(self.render_sequence(diagram))
         else:
             lines.append(self.render_elements_grouped())
             lines.append(self.render_connectors())
-
         lines.append(self.render_footer())
-        puml = "\n".join(lines)
 
+        puml = "\n".join(lines)
         base = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or (diagram.Name or "diagram"))
         os.makedirs(outdir, exist_ok=True)
         path = os.path.join(outdir, base + ".puml")
@@ -521,12 +557,12 @@ class EAPlantUMLExporter:
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Export the currently selected EA diagram to PlantUML (.puml)")
-    p.add_argument("-o", "--outdir", default=".", help="Output directory")
+    p.add_argument("-o", "--outdir", default="output", help="Output directory (default: output)")
     p.add_argument("-f", "--filename", default=None, help="Override output file name (without extension)")
     p.add_argument("-t", "--include-tags", action="store_true", default=False, help="Include Tagged Values as block notes")
     p.add_argument("-c", "--no-colors", action="store_true", default=False, help="Disable colors on elements/connectors")
     p.add_argument("-s", "--element-stereo", choices=["off", "on", "inname"], default="off",
-                   help="Element stereotypes: off (default), on (keyword suffix), inname (append to element name)")
+                   help="Element stereotypes: off (default), on (keyword suffix), inname (append to name)")
     p.add_argument("--edge-labels", choices=["stereotype", "name", "both", "none"], default="both",
                    help="Connector label policy (default: both)")
     p.add_argument("-d", "--direction", choices=["LR", "TB"], default=None, help="Layout direction (LR/TB)")
