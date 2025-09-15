@@ -7,7 +7,7 @@ The `ea2puml.py` script is a command-line tool that exports diagrams from Enterp
 - **Export the currently selected EA diagram** (from the EA Project Browser) to a PlantUML .puml file.
 - **Preserves layout**, colors, and structure as much as possible, including packages, elements, connectors, and notes.
 
-##Key Features
+## Key Features
 
 - **Element Grouping:** Groups elements inside package blocks based on their geometry (center-in-rect or area-overlap ≥ 50%).
 - **Color Preservation:** Optionally preserves EA element and connector colors in the PlantUML output.
